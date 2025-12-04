@@ -1,1 +1,61 @@
 # Meeting_summ_genesis
+
+A SaaS platform that allows users to upload meeting audio recordings and automatically generates:
+
+- Clean transcript  
+- Concise meeting minutes  
+- Actionable task lists  
+- Grounded outputs using Retrieval-Augmented Generation (RAG)
+
+This project is built by a team of two under the **Genesis Competition**, completed within a 2-week sprint.
+
+---
+
+##  Live Demo
+🔗 **Live Product URL:** _<Add your deployed link here>_
+
+🔗 **GitHub Repository:** _<Add repo URL once pushed>_
+
+---
+
+## 🧠 Features
+### **Core**
+✔ Upload audio (mp3/wav/m4a/ogg/webm)  
+✔ Whisper ASR transcription  
+✔ RAG-powered summarization  
+✔ Action item extraction  
+✔ JSON-structured output  
+✔ Clean and simple React UI  
+
+### **RAG Pipeline**
+- Transcript is chunked with overlaps  
+- OpenAI embeddings (`text-embedding-3-small`) generated for each chunk  
+- FAISS vector index used for similarity search  
+- Retrieved chunks form grounded LLM context  
+- GPT-4o generates final summary + action items  
+
+---
+
+## 🏗️ Tech Stack
+
+### **Frontend**
+- React + Vite  
+- TailwindCSS (optional)  
+- Fetch API for file uploads  
+- Deployed on Vercel/Netlify  
+
+### **Backend**
+- FastAPI  
+- Whisper ASR API  
+- OpenAI Chat Models (GPT-4o)  
+- RAG: FAISS + embeddings  
+- Deployed on Render/Railway  
+
+### **Other**
+- Python  
+- Node.js  
+- SQLite (optional persistence)  
+
+---
+
+## 📁 Project Structure
