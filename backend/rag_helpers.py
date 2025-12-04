@@ -1,16 +1,11 @@
 # backend/rag_helpers.py
-import math
 from typing import List, Tuple
 import numpy as np
 import faiss
 from openai import OpenAI
 
-# Embedding model — adjust if needed
+# Embedding model name
 EMBED_MODEL = "text-embedding-3-small"
-
-# the OpenAI client object will be created in main.py and passed in where needed.
-# But to keep helpers simple, we can accept a client argument when calling get_embeddings.
-
 
 def chunk_text(text: str, chunk_size: int = 1200, overlap: int = 300) -> List[Tuple[str, int, int]]:
     """
@@ -29,28 +24,24 @@ def chunk_text(text: str, chunk_size: int = 1200, overlap: int = 300) -> List[Tu
         start = max(0, end - overlap)
     return chunks
 
-
 def get_embeddings(client: OpenAI, texts: List[str]) -> List[List[float]]:
     """
-    Create embeddings for a list of texts using OpenAI embeddings endpoint (v1 client).
+    Create embeddings for a list of texts using OpenAI v1 client.
     Returns list of embedding vectors (lists of floats).
     """
     embs = []
-    # The v1 client supports batching but doing sequential calls is fine for small lists.
     for t in texts:
         resp = client.embeddings.create(model=EMBED_MODEL, input=t)
-        # resp may be an object or dict-like. Try common access patterns:
         try:
             emb = resp.data[0].embedding
         except Exception:
-            emb = resp['data'][0]['embedding']
+            emb = resp["data"][0]["embedding"]
         embs.append(emb)
     return embs
 
-
 def build_faiss_index(embeddings: List[List[float]]):
     """
-    Build a simple Faiss IndexFlatL2 index from embeddings (float lists).
+    Build a Faiss IndexFlatL2 index from embeddings (float lists).
     Returns the faiss index and the numpy array (float32) of embeddings.
     """
     if len(embeddings) == 0:
@@ -60,7 +51,6 @@ def build_faiss_index(embeddings: List[List[float]]):
     arr = np.array(embeddings).astype('float32')
     index.add(arr)
     return index, arr
-
 
 def search_faiss(index, query_emb: List[float], top_k: int = 4):
     """
@@ -72,10 +62,9 @@ def search_faiss(index, query_emb: List[float], top_k: int = 4):
     distances = D[0].tolist()
     return list(zip(indices, distances))
 
-
-def assemble_context(chunks: List[Tuple[str, int, int]], indices: List[int], max_chars: int = 3500) -> str:
+def assemble_context(chunks: List[Tuple[str,int,int]], indices: List[int], max_chars: int = 3500) -> str:
     """
-    Concatenate selected chunk texts in order to create the context string for the LLM prompt.
+    Concatenate selected chunk texts to create the context string for the LLM prompt.
     Limits total characters to max_chars.
     """
     parts = []
