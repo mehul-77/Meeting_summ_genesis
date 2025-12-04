@@ -7,7 +7,6 @@ A SaaS platform that allows users to upload meeting audio recordings and automat
 - Actionable task lists  
 - Grounded outputs using Retrieval-Augmented Generation (RAG)
 
-This project is built by a team of two under the **Genesis Competition**, completed within a 2-week sprint.
 
 ---
 
