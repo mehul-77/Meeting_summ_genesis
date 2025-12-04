@@ -53,7 +53,7 @@ A SaaS platform that allows users to upload meeting audio recordings and automat
 ### **Other**
 - Python  
 - Node.js  
-- SQLite (optional persistence)  
+
 
 ---
 
