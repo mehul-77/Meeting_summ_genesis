@@ -6,5 +6,4 @@ python-dotenv
 aiofiles
 pydantic
 chromadb
-cohere
 tqdm
