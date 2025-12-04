@@ -17,11 +17,11 @@ A SaaS platform that allows users to upload meeting audio recordings and automat
 
 ---
 
-## 🧠 Features
+## Features
 ### **Core**
 ✔ Upload audio (mp3/wav/m4a/ogg/webm)  
 ✔ Whisper ASR transcription  
-✔ RAG-powered summarization  
+✔ RAG-powered summarisation  
 ✔ Action item extraction  
 ✔ JSON-structured output  
 ✔ Clean and simple React UI  
@@ -30,12 +30,12 @@ A SaaS platform that allows users to upload meeting audio recordings and automat
 - Transcript is chunked with overlaps  
 - OpenAI embeddings (`text-embedding-3-small`) generated for each chunk  
 - FAISS vector index used for similarity search  
-- Retrieved chunks form grounded LLM context  
+- Retrieved chunks from grounded LLM context  
 - GPT-4o generates final summary + action items  
 
 ---
 
-## 🏗️ Tech Stack
+##  Tech Stack
 
 ### **Frontend**
 - React + Vite  
@@ -57,4 +57,4 @@ A SaaS platform that allows users to upload meeting audio recordings and automat
 
 ---
 
-## 📁 Project Structure
+
