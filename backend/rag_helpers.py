@@ -1,27 +1,21 @@
 # backend/rag_helpers.py
 from typing import List, Tuple, Optional
-import math
+import os
 import requests
 import chromadb
-from chromadb.utils import embedding_functions
 from chromadb.config import Settings
 from chromadb.api import API
-import os
-import time
 
-# Chroma client config: local persisted storage (sqlite) is enabled by default.
-# For simple in-memory only, you can set persist_directory=None.
+# Hugging Face model names (you may change)
+HF_EMBED_MODEL = os.getenv("HF_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+HF_GEN_MODEL = os.getenv("HF_GEN_MODEL", "google/flan-t5-large")
+
+# Chroma persistence (local dir)
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
 
-# Use Chroma's OpenAI-compatible embedding adapter? We'll wrap Cohere embeddings manually.
-# We'll create a Chroma client and collection per request (or reuse a singleton in main.py).
-
-# Cohere embedding model name (server-side)
-COHERE_EMBED_MODEL = "embed-english-v2.0"  # Cohere's recommended model as of 2024-2025; change if needed
-
-def chunk_text(text: str, chunk_size: int = 800, overlap: int = 200) -> List[Tuple[str, int, int]]:
+def chunk_text(text: str, chunk_size: int = 800, overlap: int = 200) -> List[Tuple[str,int,int]]:
     """
-    Split `text` into overlapping character chunks.
+    Split text into overlapping character chunks.
     Returns list of (chunk_text, start_char, end_char).
     """
     chunks = []
@@ -36,81 +30,96 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 200) -> List[Tup
         start = max(0, end - overlap)
     return chunks
 
-def cohere_embed_texts(api_key: str, texts: List[str]) -> List[List[float]]:
+def hf_embeddings(hf_api_key: str, texts: List[str], model: str = None) -> List[List[float]]:
     """
-    Call Cohere embeddings API (HTTP) to embed a list of texts.
-    Returns list of embedding vectors.
+    Call HF Inference embeddings API. Returns list of vectors (lists of floats).
     """
-    if not api_key:
-        raise ValueError("Missing Cohere API key for embeddings")
-    url = "https://api.cohere.ai/v1/embed"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-
-    # Cohere supports batching multiple inputs.
+    if model is None:
+        model = HF_EMBED_MODEL
+    url = f"https://api-inference.huggingface.co/embeddings"
+    headers = {"Authorization": f"Bearer {hf_api_key}"}
+    # The HF embeddings endpoint accepts JSON body with model and inputs
     payload = {
-        "model": COHERE_EMBED_MODEL,
-        "input": texts
+        "model": model,
+        "inputs": texts
     }
     resp = requests.post(url, json=payload, headers=headers, timeout=60)
-    if resp.status_code not in (200, 201):
-        raise RuntimeError(f"Cohere embed API failed: {resp.status_code} {resp.text}")
+    if resp.status_code not in (200,201):
+        raise RuntimeError(f"HF embeddings failed: {resp.status_code} {resp.text}")
     j = resp.json()
-    # Cohere returns 'embeddings' array
-    embeddings = j.get("embeddings") or j.get("data") or None
-    if embeddings is None:
-        # older shapes
-        raise RuntimeError(f"Unexpected Cohere embed response: {j}")
-    return embeddings
+    # HF returns {'embeddings': [...] } or a list depending on infra; handle both
+    if isinstance(j, dict) and "embeddings" in j:
+        return j["embeddings"]
+    # sometimes response is directly the list
+    if isinstance(j, list):
+        return j
+    raise RuntimeError(f"Unexpected HF embeddings response: {j}")
 
-def build_chroma_collection(collection_name: str = "meetings", persist: bool = True, client: Optional[API]=None):
+def build_chroma(collection_name: str, persist: bool = True):
     """
-    Create or get a Chroma collection. Returns (client, collection).
-    If a client is passed, reuse it.
+    Create or get a Chroma client + collection.
+    Returns (client, collection).
     """
-    # If a client is not provided, create one
-    if client is None:
-        # store on local disk; ensures persistence across restarts if persist_directory set
-        chroma_client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet", persist_directory=CHROMA_PERSIST_DIR))
+    if persist:
+        client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet", persist_directory=CHROMA_PERSIST_DIR))
     else:
-        chroma_client = client
-
-    # get or create collection
+        client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet", persist_directory=None))
     try:
-        collection = chroma_client.get_collection(name=collection_name)
+        col = client.get_collection(name=collection_name)
     except Exception:
-        collection = chroma_client.create_collection(name=collection_name)
-    return chroma_client, collection
+        col = client.create_collection(name=collection_name)
+    return client, col
 
-def upsert_embeddings_to_chroma(collection, ids: List[str], texts: List[str], embeddings: List[List[float]], metadatas=None):
-    """
-    Upsert vectors into chroma collection.
-    """
+def upsert_chroma(collection, ids: List[str], texts: List[str], embeddings: List[List[float]], metadatas=None):
     if metadatas is None:
         metadatas = [{} for _ in texts]
     collection.upsert(ids=ids, documents=texts, embeddings=embeddings, metadatas=metadatas)
 
 def query_chroma(collection, query_embedding: List[float], top_k: int = 4):
-    """
-    Query chroma collection and return the top_k results as (ids, distances, documents, metadatas)
-    """
-    results = collection.query(query_embeddings=[query_embedding], n_results=top_k, include=["distances","documents","metadatas","ids"])
-    # results dict contains lists of results per query
-    if not results:
+    res = collection.query(query_embeddings=[query_embedding], n_results=top_k, include=["documents","metadatas","distances","ids"])
+    if not res:
         return []
-    # results fields are list-of-list (single query => index 0)
-    ids = results.get("ids", [[]])[0]
-    distances = results.get("distances", [[]])[0]
-    documents = results.get("documents", [[]])[0]
-    metadatas = results.get("metadatas", [[]])[0]
+    ids = res.get("ids", [[]])[0]
+    docs = res.get("documents", [[]])[0]
+    dists = res.get("distances", [[]])[0]
+    metas = res.get("metadatas", [[]])[0]
     out = []
-    for i, _id in enumerate(ids):
-        out.append({
-            "id": _id,
-            "distance": distances[i] if i < len(distances) else None,
-            "document": documents[i] if i < len(documents) else None,
-            "metadata": metadatas[i] if i < len(metadatas) else None
-        })
+    for i,_id in enumerate(ids):
+        out.append({"id": _id, "document": docs[i] if i < len(docs) else None, "distance": dists[i] if i < len(dists) else None, "metadata": metas[i] if i < len(metas) else None})
     return out
+
+def hf_generate(hf_api_key: str, prompt: str, model: str = None, max_tokens: int = 256, temperature: float = 0.0) -> str:
+    """
+    Call HF text generation model via Inference API and return the generated text.
+    Uses the model endpoint for generation.
+    """
+    if model is None:
+        model = HF_GEN_MODEL
+    url = f"https://api-inference.huggingface.co/models/{model}"
+    headers = {"Authorization": f"Bearer {hf_api_key}", "Content-Type": "application/json"}
+    payload = {
+        "inputs": prompt,
+        "parameters": {
+            "max_new_tokens": max_tokens,
+            "temperature": temperature,
+            "return_full_text": False
+        }
+    }
+    resp = requests.post(url, json=payload, headers=headers, timeout=120)
+    if resp.status_code not in (200,201):
+        raise RuntimeError(f"HF generate failed: {resp.status_code} {resp.text}")
+    j = resp.json()
+    # HF may return {'generated_text': '...'} or list of dicts [{'generated_text': '...'}] or plain text
+    if isinstance(j, dict) and "generated_text" in j:
+        return j["generated_text"]
+    if isinstance(j, list) and len(j) > 0:
+        # some endpoints return list of generations
+        first = j[0]
+        if isinstance(first, dict) and "generated_text" in first:
+            return first["generated_text"]
+        # sometimes it's {'generated_text': '...'} nested
+        # or string
+    if isinstance(j, str):
+        return j
+    # fallback: stringify
+    return str(j)
