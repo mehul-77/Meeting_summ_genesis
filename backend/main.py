@@ -2,34 +2,32 @@
 import os
 import uuid
 import json
+import time
 from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from openai import OpenAI
 import requests
 import aiofiles
 
-# Load local .env for dev (ignored in prod)
+# load local .env if present (only for local dev)
 load_dotenv()
 
-# Environment variables (set these in Render / hosting env)
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")       # Groq transcription key (gsk_...)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")   # OpenAI classic/service key (sk-...)
+# env vars (set in Render)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
 
 if not GROQ_API_KEY:
-    raise RuntimeError("Missing GROQ_API_KEY in env. Add it in Render / Env settings.")
-if not OPENAI_API_KEY:
-    raise RuntimeError("Missing OPENAI_API_KEY in env. Add it in Render / Env settings.")
+    raise RuntimeError("Missing GROQ_API_KEY in env. Set it in Render env variables.")
+if not COHERE_API_KEY:
+    raise RuntimeError("Missing COHERE_API_KEY in env. Set it in Render env variables.")
 
-# Create OpenAI v1 client
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# Upload directory
+# upload dir
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Meeting Summarizer (Groq + OpenAI v1 RAG)")
+app = FastAPI(title="Meeting Summarizer (Groq + Cohere RAG + Chroma)")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -37,17 +35,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Import rag helpers (expects get_embeddings(client, texts))
-from rag_helpers import chunk_text, get_embeddings, build_faiss_index, search_faiss, assemble_context
+# import rag helpers
+from rag_helpers import chunk_text, cohere_embed_texts, build_chroma_collection, upsert_embeddings_to_chroma, query_chroma
 
 ALLOWED_EXT = (".mp3", ".wav", ".m4a", ".webm", ".ogg")
 
+# Cohere generation model and params
+COHERE_GEN_MODEL = os.getenv("COHERE_GEN_MODEL", "command-xlarge-nightly")  # you can change to another model available in your account
+COHERE_GEN_MAX_TOKENS = int(os.getenv("COHERE_GEN_MAX_TOKENS", "512"))
 
 @app.post("/upload")
 async def upload_audio(file: UploadFile = File(...)):
-    """Save uploaded audio and return file_id."""
     if not file.filename.lower().endswith(ALLOWED_EXT):
-        raise HTTPException(status_code=400, detail="Unsupported file type. Use mp3/wav/m4a/ogg/webm.")
+        raise HTTPException(status_code=400, detail="Unsupported file type.")
     file_id = str(uuid.uuid4())
     dest = UPLOAD_DIR / f"{file_id}-{file.filename}"
     try:
@@ -58,26 +58,15 @@ async def upload_audio(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
     return {"file_id": file_id, "filename": file.filename}
 
-
 @app.post("/process/{file_id}")
-async def process_file(file_id: str, top_k: int = Query(4, description="Number of chunks to retrieve (RAG)")):
-    """
-    Process uploaded audio:
-      1) Transcribe via Groq Whisper
-      2) Chunk transcript
-      3) Create embeddings via OpenAI v1 client
-      4) Build FAISS index, retrieve top_k
-      5) Run chat completion (OpenAI v1) with retrieved context
-    """
+async def process_file(file_id: str, top_k: int = Query(4, description="Number of chunks to retrieve for RAG")):
     # locate file
     matches = list(UPLOAD_DIR.glob(f"{file_id}-*"))
     if not matches:
         raise HTTPException(status_code=404, detail="File not found")
     audio_path = matches[0]
 
-    # -------------------------
-    # 1) Transcribe using Groq
-    # -------------------------
+    # 1) Transcribe via Groq Whisper
     try:
         with open(audio_path, "rb") as f:
             resp = requests.post(
@@ -98,93 +87,93 @@ async def process_file(file_id: str, top_k: int = Query(4, description="Number o
     if not transcript_text.strip():
         raise HTTPException(status_code=500, detail="Transcription returned empty text.")
 
-    # -------------------------
-    # 2) Chunk the transcript
-    # -------------------------
-    chunks = chunk_text(transcript_text, chunk_size=1200, overlap=300)
+    # 2) Chunk transcript
+    chunks = chunk_text(transcript_text, chunk_size=1000, overlap=250)
     chunk_texts = [c[0] for c in chunks]
 
-    # -------------------------
-    # 3) Get embeddings (OpenAI v1 client)
-    # -------------------------
+    # 3) Create embeddings via Cohere
     try:
-        embeddings = get_embeddings(client, chunk_texts)
+        embeddings = cohere_embed_texts(COHERE_API_KEY, chunk_texts)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Embeddings error: {e}")
+        raise HTTPException(status_code=500, detail=f"Cohere embeddings failed: {e}")
 
-    # -------------------------
-    # 4) Build FAISS index
-    # -------------------------
+    # 4) Create or reuse chroma collection and upsert embeddings
     try:
-        index, _arr = build_faiss_index(embeddings)
+        chroma_client, collection = build_chroma_collection(collection_name=file_id, persist=True, client=None)
+        # Prepare ids
+        ids = [f"{file_id}_chunk_{i}" for i in range(len(chunk_texts))]
+        metadatas = [{"start": chunks[i][1], "end": chunks[i][2], "source": file_id} for i in range(len(chunks))]
+        upsert_embeddings_to_chroma(collection, ids=ids, texts=chunk_texts, embeddings=embeddings, metadatas=metadatas)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"FAISS build error: {e}")
+        raise HTTPException(status_code=500, detail=f"Chroma upsert error: {e}")
 
-    # -------------------------
-    # 5) Query embedding & retrieval
-    # -------------------------
+    # 5) Query chroma with embedding of the whole transcript to get relevant chunks
     try:
-        q_resp = client.embeddings.create(model="text-embedding-3-small", input=transcript_text)
-        try:
-            query_embed = q_resp.data[0].embedding
-        except Exception:
-            query_embed = q_resp["data"][0]["embedding"]
+        query_embed_resp = cohere_embed_texts(COHERE_API_KEY, [transcript_text])
+        query_embed = query_embed_resp[0]
+        results = query_chroma(collection, query_embed, top_k=top_k)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Query embedding error: {e}")
+        raise HTTPException(status_code=500, detail=f"Chroma query / embedding error: {e}")
 
-    try:
-        hits = search_faiss(index, query_embed, top_k=top_k)
-        retrieved_indices = [h[0] for h in hits]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"FAISS search error: {e}")
+    # assemble retrieved context
+    retrieved_texts = [r["document"] for r in results]
+    context_str = "\n\n".join(retrieved_texts)
 
-    context_str = assemble_context(chunks, retrieved_indices, max_chars=3500)
-
-    # -------------------------
-    # 6) LLM summarization (OpenAI v1 chat)
-    # -------------------------
-    system_prompt = (
-        "You are an AI meeting summarizer. Use ONLY the provided context to produce a JSON object with fields:"
-        " summary (3-5 sentences), action_items (array of objects with keys: task (string), owner (optional string), due_by (optional string)),"
-        " and highlights (array of 3 short strings). DO NOT hallucinate facts or invent names/dates. If owner/due_by unknown, leave blank or null."
+    # 6) Use Cohere generate API to produce summary + action items based on retrieved context
+    system_instructions = (
+        "You are an assistant that, given meeting transcript context, returns a JSON object with fields:\n"
+        "summary: concise paragraph (3-5 sentences), action_items: list of {task, owner (optional), due_by (optional)}, highlights: 3 bullets.\n"
+        "Only use information present in the context. Return strictly valid JSON."
     )
-    user_prompt = f"Context (relevant transcript chunks):\n\n{context_str}\n\nProduce strictly valid JSON."
+    prompt = f"{system_instructions}\n\nContext:\n{context_str}\n\nReturn JSON only."
 
     try:
-        resp = client.chat.completions.create(
-            model="gpt-4o",  # change to "gpt-3.5-turbo" for cheaper inference if desired
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            max_tokens=700,
-            temperature=0.0,
-        )
-        try:
-            raw = resp.choices[0].message.content
-        except Exception:
-            raw = resp["choices"][0]["message"]["content"]
+        gen_url = "https://api.cohere.ai/v1/generate"
+        headers = {
+            "Authorization": f"Bearer {COHERE_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        gen_payload = {
+            "model": COHERE_GEN_MODEL,
+            "prompt": prompt,
+            "max_tokens": COHERE_GEN_MAX_TOKENS,
+            "temperature": 0.0,
+            "stop_sequences": ["\n\n"]
+        }
+        gen_resp = requests.post(gen_url, json=gen_payload, headers=headers, timeout=120)
+        if gen_resp.status_code not in (200,201):
+            raise HTTPException(status_code=500, detail=f"Cohere generate failed: {gen_resp.status_code} {gen_resp.text}")
+        gen_json = gen_resp.json()
+        # response structure: gen_json['generations'][0]['text'] or gen_json['text'] depending on API version
+        generated_text = None
+        if "generations" in gen_json and isinstance(gen_json["generations"], list) and len(gen_json["generations"])>0:
+            generated_text = gen_json["generations"][0].get("text") or gen_json["generations"][0].get("generation", {}).get("text")
+        elif "output" in gen_json:
+            # some API variants
+            generated_text = gen_json["output"][0] if isinstance(gen_json["output"], list) else gen_json["output"]
+        else:
+            # fallback to entire text
+            generated_text = gen_json.get("text") or str(gen_json)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Summarization error: {e}")
+        raise HTTPException(status_code=500, detail=f"Cohere generate error: {e}")
 
-    # parse JSON; fallback to raw
+    # parse JSON produced by the model
     try:
-        parsed = json.loads(raw)
+        parsed = json.loads(generated_text)
     except Exception:
-        parsed = {"summary": raw, "action_items": [], "highlights": []}
+        parsed = {"summary": generated_text, "action_items": [], "highlights": []}
 
+    # build response
     response = {
         "file_id": file_id,
         "transcript": transcript_text,
         "summary": parsed.get("summary"),
         "action_items": parsed.get("action_items"),
         "highlights": parsed.get("highlights"),
-        "retrieved_chunks": [
-            {"index": i, "text_excerpt": chunks[i][0][:300]} for i in retrieved_indices if 0 <= i < len(chunks)
-        ]
+        "retrieved_chunks": [{"id": r["id"], "distance": r["distance"], "text": r["document"][:400]} for r in results]
     }
-    return response
 
+    return response
 
 if __name__ == "__main__":
     import uvicorn
