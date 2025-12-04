@@ -2,10 +2,9 @@ fastapi
 uvicorn[standard]
 python-multipart
 requests
-openai
 python-dotenv
 aiofiles
 pydantic
-faiss-cpu
-numpy
+chromadb
+cohere
 tqdm
