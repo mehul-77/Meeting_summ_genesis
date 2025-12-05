@@ -46,7 +46,7 @@ A SaaS platform that allows users to upload meeting audio recordings and automat
 ### **Backend**
 - FastAPI  
 - Whisper ASR API  
-- OpenAI Chat Models (GPT-4o)  
+- Groq API 
 - RAG: FAISS + embeddings  
 - Deployed on Render/Railway  
 
