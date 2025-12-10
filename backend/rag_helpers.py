@@ -151,6 +151,23 @@ def upsert_embeddings_to_chroma(collection: Any, ids: List[str], texts: List[str
         collection.upsert(ids=ids, documents=texts, embeddings=embeddings, metadatas=metadatas)
 
 
+# Compatibility wrappers for older API (build_chroma, upsert_chroma)
+def build_chroma(collection_name: str, persist: bool = True):
+    """Compatibility wrapper for legacy name build_chroma.
+    Returns the same as build_chroma_collection.
+    """
+    logger.warning("build_chroma is deprecated; use build_chroma_collection")
+    return build_chroma_collection(collection_name, persist)
+
+
+def upsert_chroma(collection: Any, ids: List[str], texts: List[str], embeddings: List[List[float]], metadatas=None):
+    """Compatibility wrapper for legacy name upsert_chroma.
+    Calls upsert_embeddings_to_chroma under the hood.
+    """
+    logger.warning("upsert_chroma is deprecated; use upsert_embeddings_to_chroma")
+    return upsert_embeddings_to_chroma(collection, ids, texts, embeddings, metadatas)
+
+
 def query_chroma(collection: Any, query_embedding: List[float], top_k: int = 4):
     """
     Query chroma collection or fallback store and return list of dicts:
