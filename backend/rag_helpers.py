@@ -1,21 +1,19 @@
 # backend/rag_helpers.py
 """
-RAG helper utilities with a robust chroma fallback.
+RAG helper utilities with robust chroma fallback and name sanitization.
 
-This file:
-- Attempts to use chromadb.Client() (modern client) without deprecated Settings().
-- If chromadb import or client creation fails, falls back to a small in-memory vector store.
-- Exposes:
-    chunk_text(...)
-    hf_embeddings(...)
-    build_chroma_collection(...)
-    upsert_embeddings_to_chroma(...)
-    query_chroma(...)
-    hf_generate(...)
+Exposes:
+- chunk_text(...)
+- hf_embeddings(...)
+- build_chroma_collection(...)
+- upsert_embeddings_to_chroma(...)
+- query_chroma(...)
+- hf_generate(...)
 """
 
 from typing import List, Tuple, Optional, Any
 import os
+import re
 import requests
 import logging
 
@@ -36,6 +34,26 @@ import numpy as np
 HF_EMBED_MODEL = os.getenv("HF_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 HF_GEN_MODEL = os.getenv("HF_GEN_MODEL", "google/flan-t5-large")
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
+
+
+def sanitize_collection_name(name: str) -> str:
+    """
+    Ensure collection names follow Chroma rules:
+    - Allowed chars: a-zA-Z0-9._-
+    - Start and end with alnum
+    - Length 3-512
+    """
+    if not name:
+        return "col-startup"
+    # replace invalid chars with hyphen
+    s = re.sub(r"[^A-Za-z0-9._-]", "-", name)
+    # strip leading/trailing non-alnum characters
+    s = re.sub(r"^[^A-Za-z0-9]+", "", s)
+    s = re.sub(r"[^A-Za-z0-9]+$", "", s)
+    if len(s) < 3:
+        s = "col-" + s if s else "col-startup"
+    # truncate to 512 max
+    return s[:512]
 
 
 def chunk_text(text: str, chunk_size: int = 800, overlap: int = 200) -> List[Tuple[str, int, int]]:
@@ -77,6 +95,7 @@ def hf_embeddings(hf_api_key: str, texts: List[str], model: Optional[str] = None
 
 # ----------------- In-memory fallback vector store -----------------
 
+
 class InMemoryVectorStore:
     """Simple fallback vector store using numpy and cosine similarity."""
     def __init__(self):
@@ -114,43 +133,50 @@ class InMemoryVectorStore:
         return {"ids": [ids], "documents": [docs], "distances": [dists], "metadatas": [metas]}
 
 
-# ----------------- Chroma wrapper (new client usage) -----------------
+# ----------------- Chroma wrapper (modern client usage) -----------------
+
 
 def build_chroma_collection(collection_name: str, persist: bool = True):
     """
     Create or return a chroma collection (client, collection).
     If chromadb is not available or client init fails, returns (None, InMemoryVectorStore()).
-    This avoids deprecated Settings(...) usage.
+    Uses sanitized collection_name to avoid Chroma validation errors.
     """
+    collection_name = sanitize_collection_name(collection_name)
+
     if not HAS_CHROMA:
         logger.info("Using in-memory vector store (chromadb not available).")
         return None, InMemoryVectorStore()
 
-    # Try modern client creation without the legacy Settings(...) call.
+    # Try modern client creation without legacy Settings
     try:
-        # Most chromadb installs support chromadb.Client() with optional Settings()
-        # We prefer the simple constructor to avoid legacy config errors.
         client = None
         try:
             client = chromadb.Client()
-        except TypeError:
-            # Some older/newer versions may require Settings; fall back gently
+        except Exception as e:
+            logger.warning("chromadb.Client() failed: %s", e)
+            # try minimal Settings fallback if possible
             try:
-                from chromadb.config import Settings  # try import locally
+                from chromadb.config import Settings
                 client = chromadb.Client(Settings(persist_directory=CHROMA_PERSIST_DIR))
-            except Exception as e:
-                logger.warning("chromadb.Client(Settings(...)) also failed: %s", e)
+            except Exception as e2:
+                logger.warning("chromadb.Client(Settings(...)) failed: %s", e2)
                 client = None
 
         if client is None:
             logger.warning("Failed to construct chromadb client; using in-memory fallback.")
             return None, InMemoryVectorStore()
 
-        # create or get collection
+        # create or get collection (handle NotFound or InvalidArgument)
         try:
             collection = client.get_collection(name=collection_name)
         except Exception:
-            collection = client.create_collection(name=collection_name)
+            try:
+                collection = client.create_collection(name=collection_name)
+            except Exception as e:
+                logger.exception("Failed to create chroma collection '%s': %s", collection_name, e)
+                return None, InMemoryVectorStore()
+
         logger.info("Using chromadb collection '%s' (persist=%s).", collection_name, persist)
         return client, collection
 
@@ -164,12 +190,10 @@ def upsert_embeddings_to_chroma(collection: Any, ids: List[str], texts: List[str
     Upsert to a chroma collection or in-memory fallback.
     """
     if hasattr(collection, "upsert"):
-        # chromadb collections support upsert
         try:
             collection.upsert(ids=ids, documents=texts, embeddings=embeddings, metadatas=metadatas or [{} for _ in texts])
             return
         except TypeError:
-            # older api might use add(...)
             try:
                 collection.add(ids=ids, documents=texts, embeddings=embeddings, metadatas=metadatas or [{} for _ in texts])
                 return
@@ -180,7 +204,6 @@ def upsert_embeddings_to_chroma(collection: Any, ids: List[str], texts: List[str
     if isinstance(collection, InMemoryVectorStore):
         collection.upsert(ids=ids, documents=texts, embeddings=embeddings, metadatas=metadatas)
         return
-    # last resort: raise
     raise RuntimeError("Collection does not support upsert and is not fallback store.")
 
 
@@ -199,7 +222,6 @@ def query_chroma(collection: Any, query_embedding: List[float], top_k: int = 4):
         metas = res.get("metadatas", [[]])[0]
         return [{"id": ids[i], "document": docs[i] if i < len(docs) else None, "distance": dists[i] if i < len(dists) else None, "metadata": metas[i] if i < len(metas) else None} for i in range(len(ids))]
     else:
-        # fallback InMemoryVectorStore's query returns same wrapper shape
         res = collection.query(query_embeddings=[query_embedding], n_results=top_k, include=["documents", "metadatas", "distances", "ids"])
         ids = res.get("ids", [[]])[0]
         docs = res.get("documents", [[]])[0]
