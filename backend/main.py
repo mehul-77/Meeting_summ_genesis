@@ -19,7 +19,7 @@ logger = logging.getLogger("uvicorn.error")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 HF_API_KEY = os.getenv("HF_API_KEY")  # Hugging Face token
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads"))
-CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
+CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store"))
 
 # Basic sanity checks (fail fast on startup)
 if not GROQ_API_KEY:
@@ -53,7 +53,7 @@ from rag_helpers import (
 
 # Probe the vector store once at startup to log which backend is used (chromadb or fallback)
 try:
-    _client_probe, _collection_probe = build_chroma_collection(collection_name="__startup_probe__", persist=False)
+    _client_probe, _collection_probe = build_chroma_collection(collection_name="startup-probe", persist=False)
     logger.info("RAG helper: build_chroma_collection succeeded (chromadb or fallback available).")
 except Exception as e:
     logger.exception("RAG helper startup probe failed: %s", e)
