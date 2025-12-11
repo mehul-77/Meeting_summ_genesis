@@ -3,7 +3,7 @@ import FileUploader from './components/FileUploader';
 import MeetingView from './components/MeetingView';
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
-
+const BACKEND = import.meta.env.VITE_API_BASE;
 export default function App() {
   const [meeting, setMeeting] = useState(null)
   const [fileId, setFileId] = useState(false)
@@ -15,18 +15,25 @@ export default function App() {
     setAudioUrl(`${API_BASE}/files/${id}`)
   }
 
-  async function handleProcess(){
-    if(!fileId) return alert("Upload a file first");
-    const res = await fetch(`${API_BASE}/process/${fileId}`);
-
-    if (!res.ok) {
-      const txt = await res.text();
-      return alert(`Error processing file:` + txt);
-    }
-    const j = await res.json();
-    setMeeting(j);
+ async function handleProcess() {
+  if (!uploadedFileId) {
+    alert("Please upload first!");
+    return;
   }
 
+  try {
+    const res = await fetch(`${BACKEND}/process/${uploadedFileId}?top_k=4`, {
+      method: "POST",
+      headers: { "Accept": "application/json" }
+    });
+
+    const txt = await res.text();
+    const json = JSON.parse(txt);
+    console.log(json);
+  } catch (err) {
+    alert("Error: " + err.message);
+  }
+}
   return (
     <div className="container">
       <h1>Meeting Summarizer</h1>
