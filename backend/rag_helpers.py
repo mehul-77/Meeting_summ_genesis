@@ -1,49 +1,45 @@
 # backend/rag_helpers.py
 """
-RAG helper utilities.
+RAG helper utilities with a robust chroma fallback.
 
-This version:
-- Uses chromadb.Client(...) (no 'API' import) when available.
-- Falls back to a simple in-memory vector store using numpy if chromadb is not installed or fails.
-- Provides:
-    - chunk_text(...)
-    - hf_embeddings(...)  -> calls Hugging Face embeddings endpoint
-    - build_chroma_collection(...) -> returns (client, collection) OR (None, fallback_store)
-    - upsert_embeddings_to_chroma(...)
-    - query_chroma(...)
-    - hf_generate(...) -> calls HF generation endpoint
+This file:
+- Attempts to use chromadb.Client() (modern client) without deprecated Settings().
+- If chromadb import or client creation fails, falls back to a small in-memory vector store.
+- Exposes:
+    chunk_text(...)
+    hf_embeddings(...)
+    build_chroma_collection(...)
+    upsert_embeddings_to_chroma(...)
+    query_chroma(...)
+    hf_generate(...)
 """
+
 from typing import List, Tuple, Optional, Any
 import os
 import requests
-import math
 import logging
 
-# try chromadb import; if unavailable, we'll use a fallback
+logger = logging.getLogger(__name__)
+
+# Try importing chromadb; if not present, we'll use fallback
 try:
     import chromadb
-    from chromadb.config import Settings
     HAS_CHROMA = True
-except Exception:
+except Exception as e:
     chromadb = None
-    Settings = None
     HAS_CHROMA = False
+    logger.info("chromadb not available or failed to import: %s", e)
 
 import numpy as np
 
-# HF models (env override possible)
+# Models (env override possible)
 HF_EMBED_MODEL = os.getenv("HF_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 HF_GEN_MODEL = os.getenv("HF_GEN_MODEL", "google/flan-t5-large")
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
 
-logger = logging.getLogger(__name__)
-
 
 def chunk_text(text: str, chunk_size: int = 800, overlap: int = 200) -> List[Tuple[str, int, int]]:
-    """
-    Split text into overlapping character chunks.
-    Returns [(chunk_text, start_char, end_char), ...]
-    """
+    """Split text into overlapping character chunks."""
     chunks = []
     start = 0
     n = len(text)
@@ -57,36 +53,37 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 200) -> List[Tup
     return chunks
 
 
-def hf_embeddings(hf_api_key: str, texts: List[str], model: str = None) -> List[List[float]]:
+def hf_embeddings(hf_api_key: str, texts: List[str], model: Optional[str] = None) -> List[List[float]]:
     """
     Call Hugging Face Inference embeddings endpoint.
-    Returns list of embedding vectors (list of floats).
+    Returns list of vectors (lists of floats).
     """
     if model is None:
         model = HF_EMBED_MODEL
-    url = f"https://api-inference.huggingface.co/embeddings"
+    url = "https://api-inference.huggingface.co/embeddings"
     headers = {"Authorization": f"Bearer {hf_api_key}"}
     payload = {"model": model, "input": texts}
     resp = requests.post(url, json=payload, headers=headers, timeout=60)
     if resp.status_code not in (200, 201):
         raise RuntimeError(f"HF embeddings failed: {resp.status_code} {resp.text}")
     j = resp.json()
+    # HF may return dict with 'embeddings' or list directly
     if isinstance(j, dict) and "embeddings" in j:
         return j["embeddings"]
     if isinstance(j, list):
         return j
-    raise RuntimeError(f"Unexpected HF embeddings response: {j}")
+    raise RuntimeError(f"Unexpected HF embeddings response shape: {j}")
 
 
-# ---------- Chroma wrapper (or fallback) ----------
+# ----------------- In-memory fallback vector store -----------------
 
 class InMemoryVectorStore:
-    """Simple in-memory vector store fallback using numpy + cosine similarity."""
+    """Simple fallback vector store using numpy and cosine similarity."""
     def __init__(self):
-        self.ids = []
-        self.docs = []
-        self.embeddings = []
-        self.metadatas = []
+        self.ids: List[str] = []
+        self.docs: List[str] = []
+        self.embs: List[np.ndarray] = []
+        self.metadatas: List[dict] = []
 
     def upsert(self, ids: List[str], documents: List[str], embeddings: List[List[float]], metadatas: Optional[List[dict]] = None):
         if metadatas is None:
@@ -94,87 +91,105 @@ class InMemoryVectorStore:
         for i, _id in enumerate(ids):
             self.ids.append(_id)
             self.docs.append(documents[i])
-            self.embeddings.append(np.array(embeddings[i], dtype=np.float32))
+            self.embs.append(np.array(embeddings[i], dtype=np.float32))
             self.metadatas.append(metadatas[i])
 
     def query(self, query_embeddings: List[List[float]], n_results: int = 4, include=None):
-        q = np.array(query_embeddings[0], dtype=np.float32)
-        if len(self.embeddings) == 0:
+        if len(self.embs) == 0:
             return {"ids": [[]], "documents": [[]], "distances": [[]], "metadatas": [[]]}
-        arr = np.vstack(self.embeddings)
+        q = np.array(query_embeddings[0], dtype=np.float32)
+        arr = np.vstack(self.embs)  # shape (N, D)
         # cosine similarity
-        norms = np.linalg.norm(arr, axis=1) * np.linalg.norm(q)
-        norms = np.where(norms == 0, 1e-10, norms)
-        sims = (arr @ q) / norms
-        # get topk indices by similarity
+        arr_norm = np.linalg.norm(arr, axis=1)
+        q_norm = np.linalg.norm(q)
+        denom = arr_norm * (q_norm if q_norm != 0 else 1.0)
+        denom = np.where(denom == 0, 1e-10, denom)
+        sims = (arr @ q) / denom
         topk = min(n_results, len(sims))
         idxs = np.argsort(-sims)[:topk]
         ids = [self.ids[i] for i in idxs]
         docs = [self.docs[i] for i in idxs]
-        dists = [float(1.0 - sims[i]) for i in idxs]  # distance-like
+        dists = [float(1.0 - sims[i]) for i in idxs]
         metas = [self.metadatas[i] for i in idxs]
         return {"ids": [ids], "documents": [docs], "distances": [dists], "metadatas": [metas]}
 
 
+# ----------------- Chroma wrapper (new client usage) -----------------
+
 def build_chroma_collection(collection_name: str, persist: bool = True):
     """
-    Returns (client, collection) if chromadb is available, otherwise (None, InMemoryVectorStore()).
-    collection_name used only for chromadb.
+    Create or return a chroma collection (client, collection).
+    If chromadb is not available or client init fails, returns (None, InMemoryVectorStore()).
+    This avoids deprecated Settings(...) usage.
     """
-    if HAS_CHROMA:
-        client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet", persist_directory=CHROMA_PERSIST_DIR))
+    if not HAS_CHROMA:
+        logger.info("Using in-memory vector store (chromadb not available).")
+        return None, InMemoryVectorStore()
+
+    # Try modern client creation without the legacy Settings(...) call.
+    try:
+        # Most chromadb installs support chromadb.Client() with optional Settings()
+        # We prefer the simple constructor to avoid legacy config errors.
+        client = None
+        try:
+            client = chromadb.Client()
+        except TypeError:
+            # Some older/newer versions may require Settings; fall back gently
+            try:
+                from chromadb.config import Settings  # try import locally
+                client = chromadb.Client(Settings(persist_directory=CHROMA_PERSIST_DIR))
+            except Exception as e:
+                logger.warning("chromadb.Client(Settings(...)) also failed: %s", e)
+                client = None
+
+        if client is None:
+            logger.warning("Failed to construct chromadb client; using in-memory fallback.")
+            return None, InMemoryVectorStore()
+
+        # create or get collection
         try:
             collection = client.get_collection(name=collection_name)
         except Exception:
             collection = client.create_collection(name=collection_name)
+        logger.info("Using chromadb collection '%s' (persist=%s).", collection_name, persist)
         return client, collection
-    else:
-        # fallback in-memory
-        logger.warning("chromadb not available — using in-memory fallback vector store.")
-        store = InMemoryVectorStore()
-        return None, store
+
+    except Exception as e:
+        logger.exception("chromadb initialization failed, falling back to in-memory store: %s", e)
+        return None, InMemoryVectorStore()
 
 
-def upsert_embeddings_to_chroma(collection: Any, ids: List[str], texts: List[str], embeddings: List[List[float]], metadatas=None):
+def upsert_embeddings_to_chroma(collection: Any, ids: List[str], texts: List[str], embeddings: List[List[float]], metadatas: Optional[List[dict]] = None):
     """
-    Upsert embeddings into chroma collection or fallback store.
+    Upsert to a chroma collection or in-memory fallback.
     """
     if hasattr(collection, "upsert"):
-        # chromadb collection has upsert with named args
+        # chromadb collections support upsert
         try:
             collection.upsert(ids=ids, documents=texts, embeddings=embeddings, metadatas=metadatas or [{} for _ in texts])
+            return
         except TypeError:
-            # older chromadb signatures
-            collection.add(ids=ids, documents=texts, embeddings=embeddings, metadatas=metadatas or [{} for _ in texts])
-    else:
-        # fallback store
+            # older api might use add(...)
+            try:
+                collection.add(ids=ids, documents=texts, embeddings=embeddings, metadatas=metadatas or [{} for _ in texts])
+                return
+            except Exception as e:
+                logger.exception("Chroma collection upsert/add failed: %s", e)
+                raise
+    # fallback store (our InMemoryVectorStore)
+    if isinstance(collection, InMemoryVectorStore):
         collection.upsert(ids=ids, documents=texts, embeddings=embeddings, metadatas=metadatas)
-
-
-# Compatibility wrappers for older API (build_chroma, upsert_chroma)
-def build_chroma(collection_name: str, persist: bool = True):
-    """Compatibility wrapper for legacy name build_chroma.
-    Returns the same as build_chroma_collection.
-    """
-    logger.warning("build_chroma is deprecated; use build_chroma_collection")
-    return build_chroma_collection(collection_name, persist)
-
-
-def upsert_chroma(collection: Any, ids: List[str], texts: List[str], embeddings: List[List[float]], metadatas=None):
-    """Compatibility wrapper for legacy name upsert_chroma.
-    Calls upsert_embeddings_to_chroma under the hood.
-    """
-    logger.warning("upsert_chroma is deprecated; use upsert_embeddings_to_chroma")
-    return upsert_embeddings_to_chroma(collection, ids, texts, embeddings, metadatas)
+        return
+    # last resort: raise
+    raise RuntimeError("Collection does not support upsert and is not fallback store.")
 
 
 def query_chroma(collection: Any, query_embedding: List[float], top_k: int = 4):
     """
-    Query chroma collection or fallback store and return list of dicts:
-      [{ "id":..., "document":..., "distance":..., "metadata":... }, ...]
+    Query chroma collection or fallback in-memory store.
+    Returns list of dicts: [{id, document, distance, metadata}, ...]
     """
-    # chroma returns dict-like with lists per query
-    if HAS_CHROMA:
+    if hasattr(collection, "query"):
         res = collection.query(query_embeddings=[query_embedding], n_results=top_k, include=["documents", "metadatas", "distances", "ids"])
         if not res:
             return []
@@ -182,25 +197,20 @@ def query_chroma(collection: Any, query_embedding: List[float], top_k: int = 4):
         docs = res.get("documents", [[]])[0]
         dists = res.get("distances", [[]])[0]
         metas = res.get("metadatas", [[]])[0]
-        out = []
-        for i, _id in enumerate(ids):
-            out.append({"id": _id, "document": docs[i] if i < len(docs) else None, "distance": dists[i] if i < len(dists) else None, "metadata": metas[i] if i < len(metas) else None})
-        return out
+        return [{"id": ids[i], "document": docs[i] if i < len(docs) else None, "distance": dists[i] if i < len(dists) else None, "metadata": metas[i] if i < len(metas) else None} for i in range(len(ids))]
     else:
-        res = collection.query(query_embeddings=[query_embedding], n_results=top_k, include=["documents","metadatas","distances","ids"])
+        # fallback InMemoryVectorStore's query returns same wrapper shape
+        res = collection.query(query_embeddings=[query_embedding], n_results=top_k, include=["documents", "metadatas", "distances", "ids"])
         ids = res.get("ids", [[]])[0]
         docs = res.get("documents", [[]])[0]
         dists = res.get("distances", [[]])[0]
         metas = res.get("metadatas", [[]])[0]
-        out = []
-        for i, _id in enumerate(ids):
-            out.append({"id": _id, "document": docs[i] if i < len(docs) else None, "distance": dists[i] if i < len(dists) else None, "metadata": metas[i] if i < len(metas) else None})
-        return out
+        return [{"id": ids[i], "document": docs[i] if i < len(docs) else None, "distance": dists[i] if i < len(dists) else None, "metadata": metas[i] if i < len(metas) else None} for i in range(len(ids))]
 
 
-def hf_generate(hf_api_key: str, prompt: str, model: str = None, max_tokens: int = 256, temperature: float = 0.0) -> str:
+def hf_generate(hf_api_key: str, prompt: str, model: Optional[str] = None, max_tokens: int = 256, temperature: float = 0.0) -> str:
     """
-    Call HF text generation model via Inference API and return the generated text.
+    Call HF generation endpoint and return generated text.
     """
     if model is None:
         model = HF_GEN_MODEL
@@ -211,7 +221,7 @@ def hf_generate(hf_api_key: str, prompt: str, model: str = None, max_tokens: int
     if resp.status_code not in (200, 201):
         raise RuntimeError(f"HF generate failed: {resp.status_code} {resp.text}")
     j = resp.json()
-    # handle common response shapes
+    # various response shapes handled
     if isinstance(j, dict) and "generated_text" in j:
         return j["generated_text"]
     if isinstance(j, list) and len(j) > 0:
