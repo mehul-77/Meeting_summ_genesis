@@ -2,51 +2,72 @@ import React, { useState } from 'react'
 import FileUploader from './components/FileUploader';
 import MeetingView from './components/MeetingView';
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
-const BACKEND = import.meta.env.VITE_API_BASE;
+const API_BASE = import.meta.env.VITE_API_BASE || "https://summarizer-tool-o7sh.onrender.com";
+
 export default function App() {
-  const [meeting, setMeeting] = useState(null)
-  const [fileId, setFileId] = useState(false)
-  const [audioUrl, setAudioUrl] = useState(null)
+  const [meeting, setMeeting] = useState(null);
+  const [fileId, setFileId] = useState(null);
+  const [audioUrl, setAudioUrl] = useState(null);
 
   function handleUploaded(info) {
-    const id = info.file_id || info.fileId || info.fileId;
-    setFileId(id)
-    setAudioUrl(`${API_BASE}/files/${id}`)
+    const id = info.file_id || info.fileId;
+    setFileId(id);
+    setAudioUrl(`${API_BASE}/files/${id}`);
   }
 
- async function handleProcess() {
-  if (!uploadedFileId) {
-    alert("Please upload first!");
-    return;
+  async function handleProcess() {
+    if (!fileId) {
+      alert("Please upload first!");
+      return;
+    }
+
+    try {
+      const res = await fetch(`${API_BASE}/process/${fileId}?top_k=4`, {
+        method: "POST",
+        headers: { "Accept": "application/json" }
+      });
+
+      const text = await res.text();
+      let json;
+
+      try {
+        json = JSON.parse(text);
+      } catch {
+        alert("Invalid backend response:\n" + text);
+        return;
+      }
+
+      if (res.ok) {
+        setMeeting(json);
+      } else {
+        alert(JSON.stringify(json));
+      }
+
+    } catch (err) {
+      alert("Process failed: " + err.message);
+    }
   }
 
-  try {
-    const res = await fetch(`${BACKEND}/process/${uploadedFileId}?top_k=4`, {
-      method: "POST",
-      headers: { "Accept": "application/json" }
-    });
-
-    const txt = await res.text();
-    const json = JSON.parse(txt);
-    console.log(json);
-  } catch (err) {
-    alert("Error: " + err.message);
-  }
-}
   return (
     <div className="container">
       <h1>Meeting Summarizer</h1>
-      <FileUploader onUploaded={handleUploaded} 
-      apiBase = {API_BASE}/>
-      <div style={{marginTop:12}}>
-        <button onClick={handleProcess} className='btn' disabled={!fileId}>
+
+      <FileUploader 
+        onUploaded={handleUploaded}
+        apiBase={API_BASE}
+      />
+
+      <div style={{ marginTop: 12 }}>
+        <button 
+          onClick={handleProcess} 
+          className="btn" 
+          disabled={!fileId}
+        >
           Process uploaded file
         </button>
       </div>
 
       {meeting && <MeetingView meeting={meeting} audioUrl={audioUrl} />}
-      
     </div>
   );
 }
