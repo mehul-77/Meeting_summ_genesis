@@ -71,20 +71,19 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 200) -> List[Tup
     return chunks
 
 
-def hf_embeddings(hf_api_key: str, texts: List[str], model: Optional[str] = None):
-    import requests
-    if model is None:
-        model = HF_EMBED_MODEL
+import requests
 
-    url = "https://router.huggingface.co/v1/embeddings"
-    headers = {
-        "Authorization": f"Bearer {hf_api_key}",
-        "Content-Type": "application/json"
-    }
+def hf_embeddings(api_key, texts, model="sentence-transformers/all-MiniLM-L6-v2"):
+    url = "https://router.huggingface.co/inference/embeddings"
 
     payload = {
         "model": model,
-        "input": texts
+        "inputs": texts
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
     }
 
     resp = requests.post(url, headers=headers, json=payload, timeout=60)
@@ -93,7 +92,12 @@ def hf_embeddings(hf_api_key: str, texts: List[str], model: Optional[str] = None
         raise RuntimeError(f"HF embeddings failed: {resp.status_code} {resp.text}")
 
     data = resp.json()
-    return [item["embedding"] for item in data["data"]]
+
+    if "embeddings" not in data:
+        raise RuntimeError("HF response missing 'embeddings'")
+
+    return data["embeddings"]
+
 
 
 
