@@ -19,7 +19,8 @@ logger = logging.getLogger("uvicorn.error")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 HF_API_KEY = os.getenv("HF_API_KEY")  # Hugging Face token
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads"))
-CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store"))
+CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
+
 
 # Basic sanity checks (fail fast on startup)
 if not GROQ_API_KEY:
