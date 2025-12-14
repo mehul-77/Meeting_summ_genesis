@@ -234,26 +234,24 @@ def query_chroma(collection: Any, query_embedding: List[float], top_k: int = 4):
         return [{"id": ids[i], "document": docs[i] if i < len(docs) else None, "distance": dists[i] if i < len(dists) else None, "metadata": metas[i] if i < len(metas) else None} for i in range(len(ids))]
 
 
-def hf_generate(hf_api_key: str, prompt: str, model: Optional[str] = None, max_tokens: int = 256, temperature: float = 0.0) -> str:
-    """
-    Call HF generation endpoint and return generated text.
-    """
+def hf_generate(hf_api_key: str, prompt: str, model: Optional[str] = None, max_tokens: int = 256, temperature: float = 0.0):
+    import requests
     if model is None:
         model = HF_GEN_MODEL
-    url = f"https://api-inference.huggingface.co/models/{model}"
-    headers = {"Authorization": f"Bearer {hf_api_key}", "Content-Type": "application/json"}
-    payload = {"inputs": prompt, "parameters": {"max_new_tokens": max_tokens, "temperature": temperature, "return_full_text": False}}
-    resp = requests.post(url, json=payload, headers=headers, timeout=120)
-    if resp.status_code not in (200, 201):
+
+    url = "https://router.huggingface.co/v1/completions"
+    headers = {
+        "Authorization": f"Bearer {hf_api_key}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        "temperature": temperature
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=120)
+    if resp.status_code != 200:
         raise RuntimeError(f"HF generate failed: {resp.status_code} {resp.text}")
-    j = resp.json()
-    # various response shapes handled
-    if isinstance(j, dict) and "generated_text" in j:
-        return j["generated_text"]
-    if isinstance(j, list) and len(j) > 0:
-        first = j[0]
-        if isinstance(first, dict) and "generated_text" in first:
-            return first["generated_text"]
-    if isinstance(j, str):
-        return j
-    return str(j)
+    data = resp.json()
+    return data["choices"][0]["text"]
