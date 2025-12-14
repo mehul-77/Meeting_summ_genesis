@@ -2,7 +2,7 @@ import React, { useState } from 'react'
 import FileUploader from './components/FileUploader';
 import MeetingView from './components/MeetingView';
 
-const API_BASE = import.meta.env.VITE_API_BASE || "https://summarizer-tool-o7sh.onrender.com";
+const API_BASE = import.meta.env.VITE_API_BASE;
 
 export default function App() {
   const [meeting, setMeeting] = useState(null);
