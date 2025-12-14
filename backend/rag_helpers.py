@@ -71,26 +71,30 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 200) -> List[Tup
     return chunks
 
 
-def hf_embeddings(hf_api_key: str, texts: List[str], model: Optional[str] = None) -> List[List[float]]:
-    """
-    Call Hugging Face Inference embeddings endpoint.
-    Returns list of vectors (lists of floats).
-    """
+def hf_embeddings(hf_api_key: str, texts: List[str], model: Optional[str] = None):
+    import requests
     if model is None:
         model = HF_EMBED_MODEL
-    url = "https://api-inference.huggingface.co/embeddings"
-    headers = {"Authorization": f"Bearer {hf_api_key}"}
-    payload = {"model": model, "input": texts}
-    resp = requests.post(url, json=payload, headers=headers, timeout=60)
-    if resp.status_code not in (200, 201):
+
+    url = "https://router.huggingface.co/v1/embeddings"
+    headers = {
+        "Authorization": f"Bearer {hf_api_key}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": model,
+        "input": texts
+    }
+
+    resp = requests.post(url, headers=headers, json=payload, timeout=60)
+
+    if resp.status_code != 200:
         raise RuntimeError(f"HF embeddings failed: {resp.status_code} {resp.text}")
-    j = resp.json()
-    # HF may return dict with 'embeddings' or list directly
-    if isinstance(j, dict) and "embeddings" in j:
-        return j["embeddings"]
-    if isinstance(j, list):
-        return j
-    raise RuntimeError(f"Unexpected HF embeddings response shape: {j}")
+
+    data = resp.json()
+    return [item["embedding"] for item in data["data"]]
+
 
 
 # ----------------- In-memory fallback vector store -----------------
