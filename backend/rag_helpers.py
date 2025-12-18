@@ -1,261 +1,63 @@
-# backend/rag_helpers.py
-"""
-RAG helper utilities with robust chroma fallback and name sanitization.
-
-Exposes:
-- chunk_text(...)
-- hf_embeddings(...)
-- build_chroma_collection(...)
-- upsert_embeddings_to_chroma(...)
-- query_chroma(...)
-- hf_generate(...)
-"""
-
-from typing import List, Tuple, Optional, Any
 import os
-import re
-import requests
-import logging
+import uuid
+from typing import List
 
-logger = logging.getLogger(__name__)
+import chromadb
+from chromadb.config import Settings
+from sentence_transformers import SentenceTransformer
 
-# Try importing chromadb; if not present, we'll use fallback
-try:
-    import chromadb
-    HAS_CHROMA = True
-except Exception as e:
-    chromadb = None
-    HAS_CHROMA = False
-    logger.info("chromadb not available or failed to import: %s", e)
-
-import numpy as np
-
-# Models (env override possible)
-HF_EMBED_MODEL = os.getenv("HF_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-HF_GEN_MODEL = os.getenv("HF_GEN_MODEL", "google/flan-t5-large")
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
 
+# Load embedding model ONCE (important)
+_embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
-def sanitize_collection_name(name: str) -> str:
+
+def embed_texts(texts: List[str]) -> List[List[float]]:
     """
-    Ensure collection names follow Chroma rules:
-    - Allowed chars: a-zA-Z0-9._-
-    - Start and end with alnum
-    - Length 3-512
+    Local embeddings – FREE, no API
     """
-    if not name:
-        return "col-startup"
-    # replace invalid chars with hyphen
-    s = re.sub(r"[^A-Za-z0-9._-]", "-", name)
-    # strip leading/trailing non-alnum characters
-    s = re.sub(r"^[^A-Za-z0-9]+", "", s)
-    s = re.sub(r"[^A-Za-z0-9]+$", "", s)
-    if len(s) < 3:
-        s = "col-" + s if s else "col-startup"
-    # truncate to 512 max
-    return s[:512]
+    vectors = _embedding_model.encode(
+        texts,
+        show_progress_bar=False,
+        convert_to_numpy=True
+    )
+    return vectors.tolist()
 
 
-def chunk_text(text: str, chunk_size: int = 800, overlap: int = 200) -> List[Tuple[str, int, int]]:
-    """Split text into overlapping character chunks."""
-    chunks = []
-    start = 0
-    n = len(text)
-    while start < n:
-        end = min(start + chunk_size, n)
-        chunk = text[start:end]
-        chunks.append((chunk, start, end))
-        if end == n:
-            break
-        start = max(0, end - overlap)
-    return chunks
+def build_chroma_collection(collection_name="meetings"):
+    client = chromadb.Client(
+        Settings(
+            persist_directory=CHROMA_PERSIST_DIR,
+            anonymized_telemetry=False
+        )
+    )
 
-
-import requests
-
-def hf_embeddings(api_key, texts, model="sentence-transformers/all-MiniLM-L6-v2"):
-    url = "https://router.huggingface.co/inference/embeddings"
-
-    payload = {
-        "model": model,
-        "inputs": texts
-    }
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-
-    resp = requests.post(url, headers=headers, json=payload, timeout=60)
-
-    if resp.status_code != 200:
-        raise RuntimeError(f"HF embeddings failed: {resp.status_code} {resp.text}")
-
-    data = resp.json()
-
-    if "embeddings" not in data:
-        raise RuntimeError("HF response missing 'embeddings'")
-
-    return data["embeddings"]
-
-
-
-
-# ----------------- In-memory fallback vector store -----------------
-
-
-class InMemoryVectorStore:
-    """Simple fallback vector store using numpy and cosine similarity."""
-    def __init__(self):
-        self.ids: List[str] = []
-        self.docs: List[str] = []
-        self.embs: List[np.ndarray] = []
-        self.metadatas: List[dict] = []
-
-    def upsert(self, ids: List[str], documents: List[str], embeddings: List[List[float]], metadatas: Optional[List[dict]] = None):
-        if metadatas is None:
-            metadatas = [{} for _ in documents]
-        for i, _id in enumerate(ids):
-            self.ids.append(_id)
-            self.docs.append(documents[i])
-            self.embs.append(np.array(embeddings[i], dtype=np.float32))
-            self.metadatas.append(metadatas[i])
-
-    def query(self, query_embeddings: List[List[float]], n_results: int = 4, include=None):
-        if len(self.embs) == 0:
-            return {"ids": [[]], "documents": [[]], "distances": [[]], "metadatas": [[]]}
-        q = np.array(query_embeddings[0], dtype=np.float32)
-        arr = np.vstack(self.embs)  # shape (N, D)
-        # cosine similarity
-        arr_norm = np.linalg.norm(arr, axis=1)
-        q_norm = np.linalg.norm(q)
-        denom = arr_norm * (q_norm if q_norm != 0 else 1.0)
-        denom = np.where(denom == 0, 1e-10, denom)
-        sims = (arr @ q) / denom
-        topk = min(n_results, len(sims))
-        idxs = np.argsort(-sims)[:topk]
-        ids = [self.ids[i] for i in idxs]
-        docs = [self.docs[i] for i in idxs]
-        dists = [float(1.0 - sims[i]) for i in idxs]
-        metas = [self.metadatas[i] for i in idxs]
-        return {"ids": [ids], "documents": [docs], "distances": [dists], "metadatas": [metas]}
-
-
-# ----------------- Chroma wrapper (modern client usage) -----------------
-
-
-def build_chroma_collection(collection_name: str, persist: bool = True):
-    """
-    Create or return a chroma collection (client, collection).
-    If chromadb is not available or client init fails, returns (None, InMemoryVectorStore()).
-    Uses sanitized collection_name to avoid Chroma validation errors.
-    """
-    collection_name = sanitize_collection_name(collection_name)
-
-    if not HAS_CHROMA:
-        logger.info("Using in-memory vector store (chromadb not available).")
-        return None, InMemoryVectorStore()
-
-    # Try modern client creation without legacy Settings
     try:
-        client = None
-        try:
-            client = chromadb.Client()
-        except Exception as e:
-            logger.warning("chromadb.Client() failed: %s", e)
-            # try minimal Settings fallback if possible
-            try:
-                from chromadb.config import Settings
-                client = chromadb.Client(Settings(persist_directory=CHROMA_PERSIST_DIR))
-            except Exception as e2:
-                logger.warning("chromadb.Client(Settings(...)) failed: %s", e2)
-                client = None
+        collection = client.get_collection(name=collection_name)
+    except:
+        collection = client.create_collection(name=collection_name)
 
-        if client is None:
-            logger.warning("Failed to construct chromadb client; using in-memory fallback.")
-            return None, InMemoryVectorStore()
-
-        # create or get collection (handle NotFound or InvalidArgument)
-        try:
-            collection = client.get_collection(name=collection_name)
-        except Exception:
-            try:
-                collection = client.create_collection(name=collection_name)
-            except Exception as e:
-                logger.exception("Failed to create chroma collection '%s': %s", collection_name, e)
-                return None, InMemoryVectorStore()
-
-        logger.info("Using chromadb collection '%s' (persist=%s).", collection_name, persist)
-        return client, collection
-
-    except Exception as e:
-        logger.exception("chromadb initialization failed, falling back to in-memory store: %s", e)
-        return None, InMemoryVectorStore()
+    return client, collection
 
 
-def upsert_embeddings_to_chroma(collection: Any, ids: List[str], texts: List[str], embeddings: List[List[float]], metadatas: Optional[List[dict]] = None):
-    """
-    Upsert to a chroma collection or in-memory fallback.
-    """
-    if hasattr(collection, "upsert"):
-        try:
-            collection.upsert(ids=ids, documents=texts, embeddings=embeddings, metadatas=metadatas or [{} for _ in texts])
-            return
-        except TypeError:
-            try:
-                collection.add(ids=ids, documents=texts, embeddings=embeddings, metadatas=metadatas or [{} for _ in texts])
-                return
-            except Exception as e:
-                logger.exception("Chroma collection upsert/add failed: %s", e)
-                raise
-    # fallback store (our InMemoryVectorStore)
-    if isinstance(collection, InMemoryVectorStore):
-        collection.upsert(ids=ids, documents=texts, embeddings=embeddings, metadatas=metadatas)
-        return
-    raise RuntimeError("Collection does not support upsert and is not fallback store.")
+def add_chunks(collection, texts: List[str], metadatas: List[dict]):
+    ids = [str(uuid.uuid4()) for _ in texts]
+    embeddings = embed_texts(texts)
+
+    collection.add(
+        ids=ids,
+        documents=texts,
+        embeddings=embeddings,
+        metadatas=metadatas
+    )
 
 
-def query_chroma(collection: Any, query_embedding: List[float], top_k: int = 4):
-    """
-    Query chroma collection or fallback in-memory store.
-    Returns list of dicts: [{id, document, distance, metadata}, ...]
-    """
-    if hasattr(collection, "query"):
-        res = collection.query(query_embeddings=[query_embedding], n_results=top_k, include=["documents", "metadatas", "distances", "ids"])
-        if not res:
-            return []
-        ids = res.get("ids", [[]])[0]
-        docs = res.get("documents", [[]])[0]
-        dists = res.get("distances", [[]])[0]
-        metas = res.get("metadatas", [[]])[0]
-        return [{"id": ids[i], "document": docs[i] if i < len(docs) else None, "distance": dists[i] if i < len(dists) else None, "metadata": metas[i] if i < len(metas) else None} for i in range(len(ids))]
-    else:
-        res = collection.query(query_embeddings=[query_embedding], n_results=top_k, include=["documents", "metadatas", "distances", "ids"])
-        ids = res.get("ids", [[]])[0]
-        docs = res.get("documents", [[]])[0]
-        dists = res.get("distances", [[]])[0]
-        metas = res.get("metadatas", [[]])[0]
-        return [{"id": ids[i], "document": docs[i] if i < len(docs) else None, "distance": dists[i] if i < len(dists) else None, "metadata": metas[i] if i < len(metas) else None} for i in range(len(ids))]
+def query_chunks(collection, query: str, top_k: int = 4):
+    query_embedding = embed_texts([query])[0]
 
+    results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=top_k
+    )
 
-def hf_generate(hf_api_key: str, prompt: str, model: Optional[str] = None, max_tokens: int = 256, temperature: float = 0.0):
-    import requests
-    if model is None:
-        model = HF_GEN_MODEL
-
-    url = "https://router.huggingface.co/v1/completions"
-    headers = {
-        "Authorization": f"Bearer {hf_api_key}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "max_tokens": max_tokens,
-        "temperature": temperature
-    }
-    resp = requests.post(url, headers=headers, json=payload, timeout=120)
-    if resp.status_code != 200:
-        raise RuntimeError(f"HF generate failed: {resp.status_code} {resp.text}")
-    data = resp.json()
-    return data["choices"][0]["text"]
+    return results["documents"][0] if results["documents"] else []
