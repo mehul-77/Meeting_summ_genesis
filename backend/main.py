@@ -108,6 +108,10 @@ async def process(file_id: str, top_k: int = Query(4)):
         raise HTTPException(404, "File not found")
 
     audio = matches[0]
+@app.get("/__routes")
+def list_routes():
+    return [r.path for r in app.routes]
+
 
     # ---- TRANSCRIPTION ----
     with open(audio, "rb") as f:
