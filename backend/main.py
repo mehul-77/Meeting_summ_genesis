@@ -62,7 +62,7 @@ def groq_embeddings(texts):
             "Content-Type": "application/json",
         },
         json={
-            "model": "text-embedding-3-small",
+            "model": "nomic-embed-text-v1.5",  # Use this model for Groq
             "input": texts,
         },
         timeout=60,
@@ -70,7 +70,6 @@ def groq_embeddings(texts):
     if r.status_code != 200:
         raise RuntimeError(f"Embedding error: {r.text}")
     return [d["embedding"] for d in r.json()["data"]]
-
 def groq_generate(prompt):
     r = requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
