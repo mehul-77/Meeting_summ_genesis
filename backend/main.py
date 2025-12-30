@@ -80,8 +80,17 @@ def groq_generate(prompt):
         raise e
 
 # ---------------- ROUTES ----------------
+from fastapi.responses import FileResponse
+
+@app.get("/files/{file_id}")
+async def get_file(file_id: str):
+    matches = list(UPLOAD_DIR.glob(f"{file_id}-*"))
+    if not matches:
+        raise HTTPException(404, "File not found")
+    return FileResponse(matches[0])
 
 @app.get("/")
+
 def home():
     return {"status": "online", "message": "Go to /docs to test the API"}
 
