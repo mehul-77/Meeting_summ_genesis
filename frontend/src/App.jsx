@@ -52,6 +52,10 @@ export default function App() {
     <div className="container">
       <h1>Meeting Summarizer</h1>
 
+      <p className="small">
+        Upload a meeting audio file and get transcript, summary, and action items.
+        </p>
+
       <FileUploader 
         onUploaded={handleUploaded}
         apiBase={API_BASE}
