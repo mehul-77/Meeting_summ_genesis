@@ -46,7 +46,10 @@ export default function FileUploader({ onUploaded, apiBase }) {
         Pick audio file
       </button>
       <div style={{ marginTop: 8 }}>
-        <div>Status: {status} {progress > 0 && <>— {progress}%</>}</div>
+        <div className="status">
+          Status: <strong>{status}</strong>
+          {progress > 0 && <> • {progress}%</>}
+          </div>
       </div>
       <div className="hint">or drag & drop an audio file here</div>
     </div>
